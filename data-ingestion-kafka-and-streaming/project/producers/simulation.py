@@ -1,6 +1,8 @@
 """Defines a time simulation responsible for executing any registered
 producers
 """
+from models import Line, Weather
+from connector import configure_connector
 import datetime
 import time
 from enum import IntEnum
@@ -12,9 +14,6 @@ import pandas as pd
 
 # Import logging before models to ensure configuration is picked up
 logging.config.fileConfig(f"{Path(__file__).parents[0]}/logging.ini")
-
-from connector import configure_connector
-from models import Line, Weather
 
 
 logger = logging.getLogger(__name__)
@@ -71,7 +70,8 @@ class TimeSimulation:
                 # Send weather on the top of the hour
                 if curr_time.minute == 0:
                     weather.run(curr_time.month)
-                _ = [line.run(curr_time, self.time_step) for line in self.train_lines]
+                _ = [line.run(curr_time, self.time_step)
+                     for line in self.train_lines]
                 curr_time = curr_time + self.time_step
                 time.sleep(self.sleep_seconds)
         except KeyboardInterrupt as e:

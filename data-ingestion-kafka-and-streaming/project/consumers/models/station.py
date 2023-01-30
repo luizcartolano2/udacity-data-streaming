@@ -32,7 +32,8 @@ class Station:
 
     def handle_arrival(self, direction, train_id, train_status):
         """Unpacks arrival data"""
-        status_dict = {"train_id": train_id, "status": train_status.replace("_", " ")}
+        status_dict = {"train_id": train_id,
+                       "status": train_status.replace("_", " ")}
         if direction == "a":
             self.dir_a = status_dict
         else:
