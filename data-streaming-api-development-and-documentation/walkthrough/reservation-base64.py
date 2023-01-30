@@ -2,52 +2,90 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, to_json, col, unbase64, base64, split, expr
 from pyspark.sql.types import StructField, StructType, StringType, BooleanType, ArrayType, DateType
 
-# Schema for the kafka connect redis source: 
-# {"key":"dGVzdGtleQ==","existType":"NONE","ch":false,"incr":false,"zSetEntries":[{"element":"dGVzdHZhbHVl","score":0.0}],"zsetEntries":[{"element":"dGVzdHZhbHVl","score":0.0}]}
+# this is a manually created schema - before Spark 3.0.0, schema inference is not automatic
+
 redisMessageSchema = StructType(
     [
         StructField("key", StringType()),
         StructField("value", StringType()),
         StructField("expiredType", StringType()),
-        StructField("expiredValue",StringType()),
+        StructField("expiredValue", StringType()),
         StructField("existType", StringType()),
         StructField("ch", StringType()),
-        StructField("incr",BooleanType()),
-        StructField("zSetEntries", ArrayType( \
+        StructField("incr", BooleanType()),
+        StructField("zSetEntries", ArrayType(
             StructType([
-                StructField("element", StringType()),\
-                StructField("score", StringType())   \
-            ]))                                      \
+                StructField("element", StringType()),
+                StructField("score", StringType())
+            ]))
         )
 
     ]
 )
 
-# TO-DO: create a StructType for the Reservation schema for the following fields:
-# {"reservationId":"814840107","customerName":"Jim Harris", "truckNumber":"15867", "reservationDate":"Sep 29, 2020, 10:06:23 AM"}
 
-# TO-DO: create a spark session, with an appropriately named application name
+# this is a manually created schema - before Spark 3.0.0, schema inference is not automatic
+# "{"reservationId":"1603561552180",
+# "customerId":"470948385",
+# "customerName":"Chuck Jones",
+# "truckNumber":"2416",
+# "reservationDate":"2020-10-24T17:45:52.180Z",
+# "checkInStatus":"CheckedOut",
+# "origin":"Arizona",
+# "destination":"Michigan"}
+reservationSchema = StructType(
+    [
+        StructField("reservationId", StringType()),
+        StructField("customerId", StringType()),
+        StructField("customerName", StringType()),
+        StructField("truckNumber", StringType()),
+        StructField("reservationDate", StringType()),
+        StructField("checkInStatus", StringType()),
+        StructField("origin", StringType()),
+        StructField("destination", StringType()),
 
-#TO-DO: set the log level to WARN
-
-#TO-DO: read the redis-server kafka topic as a source into a streaming dataframe with the bootstrap server kafka:19092, configuring the stream to read the earliest messages possible                                    
-
-#TO-DO: using a select expression on the streaming dataframe, cast the key and the value columns from kafka as strings, and then select them
-
-#TO-DO: using the redisMessageSchema StructType, deserialize the JSON from the streaming dataframe 
-
-# TO-DO: create a temporary streaming view called "RedisData" based on the streaming dataframe
-# it can later be queried with spark.sql
-
-#TO-DO: using spark.sql, select key, zSetEntries[0].element as reservation from RedisData
-
-#TO-DO: from the dataframe use the unbase64 function to select a column called reservation with the base64 decoded JSON, and cast it to a string
-
-#TO-DO: using the customer location StructType, deserialize the JSON from the streaming dataframe, selecting column reservation.* as a temporary view called TruckReservation 
-
-#TO-DO: using spark.sql select * from CustomerLocation
-
-# TO-DO: write the stream to the console, and configure it to run indefinitely, the console output will look something like this:
+    ]
+)
 
 
+# the source for this data pipeline is a kafka topic, defined below
+spark = SparkSession.builder.appName("truck-reservation").getOrCreate()
+spark.sparkContext.setLogLevel('WARN')
 
+redisServerRawStreamingDF = spark                          \
+    .readStream                                          \
+    .format("kafka")                                     \
+    .option("kafka.bootstrap.servers", "localhost:9092") \
+    .option("subscribe", "redis-server")                  \
+    .option("startingOffsets", "earliest")\
+    .load()
+
+# it is necessary for Kafka Data Frame to be readable, to cast each field from a binary to a string
+redisServerStreamingDF = redisServerRawStreamingDF.selectExpr(
+    "cast(key as string) key", "cast(value as string) value")
+
+# this creates a temporary streaming view based on the streaming dataframe
+# it can later be queried with spark.sql, we will cover that in the next section
+redisServerStreamingDF.withColumn("value", from_json("value", redisMessageSchema))\
+    .select(col('value.*')) \
+    .createOrReplaceTempView("RedisData")
+
+# Using spark.sql we can select any valid select statement from the spark view
+zSetEntriesEncodedStreamingDF = spark.sql(
+    "select key, zSetEntries[0].element as reservation from RedisData")
+
+zSetDecodedEntriesStreamingDF = zSetEntriesEncodedStreamingDF.withColumn(
+    "reservation", unbase64(zSetEntriesEncodedStreamingDF.reservation).cast("string"))
+
+zSetDecodedEntriesStreamingDF\
+    .withColumn("reservation", from_json("reservation", reservationSchema))\
+    .select(col('reservation.*'))\
+    .createOrReplaceTempView("TruckReservation")\
+
+truckReservationStreamingDF = spark.sql(
+    "select * from TruckReservation where reservationDate is not null")
+
+# this takes the stream and "sinks" it to the console as it is updated one message at a time (null means the JSON parsing didn't match the fields in the schema):
+
+truckReservationStreamingDF.writeStream.outputMode(
+    "append").format("console").start().awaitTermination()

@@ -1,17 +1,29 @@
 from pyspark.sql import SparkSession
 
-# TO-DO: create a spark session, with an appropriately named application name
+# the source for this data pipeline is a kafka topic, defined below
+spark = SparkSession.builder.appName("fuel-level").getOrCreate()
+spark.sparkContext.setLogLevel('WARN')
 
-#TO-DO: set the log level to WARN
+fuelLevelRawStreamingDF = spark                          \
+    .readStream                                          \
+    .format("kafka")                                     \
+    .option("kafka.bootstrap.servers", "localhost:9092") \
+    .option("subscribe", "fuel-level")                  \
+    .option("startingOffsets", "earliest")\
+    .load()
 
-#TO-DO: read the fuel-level kafka topic as a source into a streaming dataframe with the bootstrap server kafka:19092, configuring the stream to read the earliest messages possible                                    
+# it is necessary for Kafka Data Frame to be readable, to cast each field from a binary to a string
+fuelLevelStreamingDF = fuelLevelRawStreamingDF.selectExpr(
+    "cast(key as string) key", "cast(value as string) value")
 
-#TO-DO: using a select expression on the streaming dataframe, cast the key and the value columns from kafka as strings, and then select them
+# this creates a temporary streaming view based on the streaming dataframe
+# it can later be queried with spark.sql, we will cover that in the next section
+fuelLevelStreamingDF.createOrReplaceTempView("FuelLevel")
 
-# TO-DO: create a temporary streaming view called "FuelLevel" based on the streaming dataframe
-# it can later be queried with spark.sql, we will cover that in the next section 
+# Using spark.sql we can select any valid select statement from the spark view
+fuelLevelSelectStarDF = spark.sql("select * from FuelLevel")
 
-# TO-DO: write the stream from the select expression earlier to the console, and configure it to run indefinitely, the console output will look something like this:
+# this takes the stream and "sinks" it to the console as it is updated one message at a time:
 # +----+-----+
 # | key|value|
 # +----+-----+
@@ -20,3 +32,6 @@ from pyspark.sql import SparkSession
 # | 199|    9|
 # |3459|   27|
 # +----+-----+
+
+fuelLevelSelectStarDF.writeStream.outputMode(
+    "append").format("console").start().awaitTermination()

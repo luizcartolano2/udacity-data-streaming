@@ -9,54 +9,111 @@ redisMessageSchema = StructType(
         StructField("key", StringType()),
         StructField("value", StringType()),
         StructField("expiredType", StringType()),
-        StructField("expiredValue",StringType()),
+        StructField("expiredValue", StringType()),
         StructField("existType", StringType()),
         StructField("ch", StringType()),
-        StructField("incr",BooleanType()),
-        StructField("zSetEntries", ArrayType( \
+        StructField("incr", BooleanType()),
+        StructField("zSetEntries", ArrayType(
             StructType([
-                StructField("element", StringType()),\
-                StructField("score", StringType())   \
-            ]))                                      \
+                StructField("element", StringType()),
+                StructField("score", StringType())
+            ]))
         )
 
     ]
 )
 
-# TO-DO: create a StructType for the Reservation schema for the following fields:
+# this is a manually created schema - before Spark 3.0.0, schema inference is not automatic
 # {"reservationId":"814840107","customerName":"Jim Harris", "truckNumber":"15867", "reservationDate":"Sep 29, 2020, 10:06:23 AM"}
+reservationJSONSchema = StructType(
+    [
+        StructField("reservationId", StringType()),
+        StructField("customerName", StringType()),
+        StructField("truckNumber", StringType()),
+        StructField("reservationDate", StringType()),
+    ]
+)
 
-# TO-DO: create a StructType for the Payment schema for the following fields:
-# {"reservationId":"9856743232","customerName":"Frank Aristotle","date":"Sep 29, 2020, 10:06:23 AM","amount":"946.88"}
+# this is a manually created schema - before Spark 3.0.0, schema inference is not automatic
+# since we are not using the date and amount in sql calculations, we are going
+# to cast them as strings
+# {"reservationId":"9856743232","customerName":"Frank Aristotle","amount":"946.88"}
+paymentJSONSchema = StructType(
+    [
+        StructField("reservationId", StringType()),
+        StructField("customerName", StringType()),
+        StructField("amount", StringType())
+    ]
+)
 
-# TO-DO: create a spark session, with an appropriately named application name
+# the source for this data pipeline is a kafka topic, defined below
+spark = SparkSession.builder.appName("reservation-payment").getOrCreate()
+spark.sparkContext.setLogLevel('WARN')
 
-#TO-DO: set the log level to WARN
+redisServerRawStreamingDF = spark                          \
+    .readStream                                          \
+    .format("kafka")                                     \
+    .option("kafka.bootstrap.servers", "localhost:9092") \
+    .option("subscribe", "redis-server")                  \
+    .option("startingOffsets", "earliest")\
+    .load()
 
-#TO-DO: read the redis-server kafka topic as a source into a streaming dataframe with the bootstrap server kafka:19092, configuring the stream to read the earliest messages possible                                    
+# it is necessary for Kafka Data Frame to be readable, to cast each field from a binary to a string
+redisServerStreamingDF = redisServerRawStreamingDF.selectExpr(
+    "cast(key as string) key", "cast(value as string) value")
 
-#TO-DO: using a select expression on the streaming dataframe, cast the key and the value columns from kafka as strings, and then select them
+# this creates a temporary streaming view based on the streaming dataframe
+# it can later be queried with spark.sql, we will cover that in the next section
+redisServerStreamingDF.withColumn("value", from_json("value", redisMessageSchema))\
+    .select(col('value.*')) \
+    .createOrReplaceTempView("RedisData")
 
-#TO-DO: using the redisMessageSchema StructType, deserialize the JSON from the streaming dataframe 
+# Using spark.sql we can select any valid select statement from the spark view
+zSetEntriesEncodedStreamingDF = spark.sql(
+    "select key, zSetEntries[0].element as redisEvent from RedisData")
 
-# TO-DO: create a temporary streaming view called "RedisData" based on the streaming dataframe
-# it can later be queried with spark.sql
+# Here we are base64 decoding the redisEvent
+zSetDecodedEntriesStreamingDF1 = zSetEntriesEncodedStreamingDF.withColumn(
+    "redisEvent", unbase64(zSetEntriesEncodedStreamingDF.redisEvent).cast("string"))
+zSetDecodedEntriesStreamingDF2 = zSetEntriesEncodedStreamingDF.withColumn(
+    "redisEvent", unbase64(zSetEntriesEncodedStreamingDF.redisEvent).cast("string"))
 
-#TO-DO: using spark.sql, select key, zSetEntries[0].element as redisEvent from RedisData
+# Filter DF1 for only those that contain the reservationDate field (customer record)
+zSetDecodedEntriesStreamingDF1.filter(
+    col("redisEvent").contains("reservationDate"))
 
-#TO-DO: from the dataframe use the unbase64 function to select a column called redisEvent with the base64 decoded JSON, and cast it to a string
+# Filter DF2 for only those that do not (~) contain the birthDay field (all records other than customer) we will filter out null rows later
+zSetDecodedEntriesStreamingDF2.filter(
+    ~(col("redisEvent").contains("reservationDate")))
 
-#TO-DO: repeat this a second time, so now you have two separate dataframes that contain redisEvent data
 
-#TO-DO: using the reservation StructType, deserialize the JSON from the first redis decoded streaming dataframe, selecting column reservation.* as a temporary view called Reservation 
+# Now we are parsing JSON from the redisEvent that contains reservation data
+zSetDecodedEntriesStreamingDF1\
+    .withColumn("reservation", from_json("redisEvent", reservationJSONSchema))\
+    .select(col('reservation.*'))\
+    .createOrReplaceTempView("Reservation")\
 
-#TO-DO: using the payment StructType, deserialize the JSON from the second redis decoded streaming dataframe, selecting column payment.* as a temporary view called Payment 
+# Last we are parsing JSON from the redisEvent that contains payment data
+zSetDecodedEntriesStreamingDF2\
+    .withColumn("payment", from_json("redisEvent", paymentJSONSchema))\
+    .select(col('payment.*'))\
+    .createOrReplaceTempView("Payment")\
 
-#TO-DO: using spark.sql select select reservationId, reservationDate from Reservation where reservationDate is not null
+# Select only the fields you need
+reservationStreamingDF = spark.sql(
+    "select reservationId, reservationDate from Reservation where reservationDate is not null")
 
-#TO-DO: using spark.sql select reservationId as paymentReservationId, date as paymentDate, amount as paymentAmount from Payment
+# Let's use some more column alisases on the payment fields
+paymentStreamingDF = spark.sql(
+    "select reservationId as paymentReservationId, amount as paymentAmount from Payment")
 
-#TO-DO: join the reservation and payment data using the expression: reservationId=paymentReservationId
+paymentStreamingDF = reservationStreamingDF.join(paymentStreamingDF, expr("""
+   reservationId=paymentReservationId
+"""
+                                                                          ))
 
-# TO-DO: write the stream to the console, and configure it to run indefinitely
+# This takes the stream and "sinks" it to the console as it is updated one message at a time:
 # can you find the reservations who haven't made a payment on their reservation?
+
+paymentStreamingDF.writeStream.outputMode(
+    "append").format("console").start().awaitTermination()
