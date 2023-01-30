@@ -1,26 +1,46 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, to_json, col, unbase64, base64, split, expr
 from pyspark.sql.types import StructField, StructType, StringType, BooleanType, ArrayType, DateType
-
-# TO-DO: create a kafka message schema StructType including the following JSON elements:
+# this is a manually created schema - before Spark 3.0.0, schema inference is not automatic
+# since we are not using the odometer or miles from shop in sql calculations, we are going
+# to cast them as strings
 # {"truckNumber":"5169","destination":"Florida","milesFromShop":505,"odomoterReading":50513}
+kafkaMessageSchema = StructType(
+    [
+        StructField("truckNumber", StringType()),
+        StructField("destination", StringType()),
+        StructField("milesFromShop", StringType()),
+        StructField("odometerReading", StringType())
+    ]
 
-# TO-DO: create a spark session, with an appropriately named application name
+)
 
-#TO-DO: set the log level to WARN
+# the source for this data pipeline is a kafka topic, defined below
+spark = SparkSession.builder.appName("vehicle-status").getOrCreate()
+spark.sparkContext.setLogLevel('WARN')
 
-#TO-DO: read the vehicle-status kafka topic as a source into a streaming dataframe with the bootstrap server localhost:9092, configuring the stream to read the earliest messages possible                                    
+vehicleStatusRawStreamingDF = spark                          \
+    .readStream                                          \
+    .format("kafka")                                     \
+    .option("kafka.bootstrap.servers", "localhost:9092") \
+    .option("subscribe", "vehicle-status")                  \
+    .option("startingOffsets", "earliest")\
+    .load()
 
-#TO-DO: using a select expression on the streaming dataframe, cast the key and the value columns from kafka as strings, and then select them
+# it is necessary for Kafka Data Frame to be readable, to cast each field from a binary to a string
+vehicleStatusStreamingDF = vehicleStatusRawStreamingDF.selectExpr(
+    "cast(key as string) key", "cast(value as string) value")
 
-#TO-DO: using the kafka message StructType, deserialize the JSON from the streaming dataframe 
+# this creates a temporary streaming view based on the streaming dataframe
+# it can later be queried with spark.sql, we will cover that in the next section
+vehicleStatusStreamingDF.withColumn("value", from_json("value", kafkaMessageSchema))\
+    .select(col('value.*')) \
+    .createOrReplaceTempView("VehicleStatus")
 
-# TO-DO: create a temporary streaming view called "VehicleStatus" 
-# it can later be queried with spark.sql
+# Using spark.sql we can select any valid select statement from the spark view
+vehicleStatusSelectStarDF = spark.sql("select * from VehicleStatus")
 
-#TO-DO: using spark.sql, select * from VehicleStatus
-
-# TO-DO: write the stream to the console, and configure it to run indefinitely, the console output will look something like this:
+# this takes the stream and "sinks" it to the console as it is updated one message at a time:
 # +-----------+------------+-------------+---------------+
 # |truckNumber| destination|milesFromShop|odometerReading|
 # +-----------+------------+-------------+---------------+
@@ -30,4 +50,5 @@ from pyspark.sql.types import StructField, StructType, StringType, BooleanType, 
 # |       5540|South Dakota|          856|         176293|
 # +-----------+------------+-------------+---------------+
 
-
+vehicleStatusSelectStarDF.writeStream.outputMode(
+    "append").format("console").start().awaitTermination()
